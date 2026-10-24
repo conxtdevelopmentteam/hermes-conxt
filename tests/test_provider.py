@@ -13,6 +13,7 @@ import importlib.util
 import json
 import sys
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -34,22 +35,26 @@ conxt = _load()
 
 
 class StandIn:
-    """A tiny Conxt: answers the four routes and records each request."""
+    """A tiny Conxt: answers the routes the provider uses and records each request."""
 
     def __init__(self):
         self.requests: list[dict] = []
         self.replies: dict[str, tuple[int, dict]] = {
             "/context/": (200, {"context_block": "- Deploys freeze on Fridays.", "memory_count": 2, "pinned_count": 1}),
             "/capture/": (200, {"status": "captured", "session_id": "s1", "turn_count": 2}),
+            "/extract/": (200, {"status": "extracted", "session_id": "s1"}),
             "/import/": (200, {"imported": 1, "reinforced": 0, "redacted": 0, "message": "Imported 1 memory."}),
             f"/teams/{TEAM}/memories/create": (200, {"id": "m1", "status": "pending"}),
         }
+        self.delays: dict[str, float] = {}  # seconds a route takes to answer
         stand_in = self
 
         class Handler(BaseHTTPRequestHandler):
             def do_POST(self):
                 body = json.loads(self.rfile.read(int(self.headers["Content-Length"])) or b"{}")
                 stand_in.requests.append({"path": self.path, "auth": self.headers.get("Authorization"), "body": body})
+                if self.path in stand_in.delays:
+                    time.sleep(stand_in.delays[self.path])
                 status, reply = stand_in.replies.get(self.path, (404, {"detail": "Not Found"}))
                 data = json.dumps(reply).encode()
                 self.send_response(status)
@@ -67,6 +72,9 @@ class StandIn:
 
     def paths(self):
         return [r["path"] for r in self.requests]
+
+    def sent(self, path):
+        return [r for r in self.requests if r["path"] == path]
 
 
 @pytest.fixture
@@ -193,10 +201,62 @@ def test_a_session_is_captured_as_hermes_when_it_ends(server, secrets, tmp_path)
     assert server.requests == []  # buffered, not sent per turn
     p.on_session_end([])
     wait_for_flush(p)
-    (req,) = server.requests
-    assert req["path"] == "/capture/" and req["body"]["source"] == "hermes"
+    (req,) = server.sent("/capture/")
+    assert req["body"]["source"] == "hermes"
     assert [t["role"] for t in req["body"]["raw_turns"]] == ["user", "assistant"]
     assert p._buffer == []
+
+
+def test_a_stored_conversation_is_handed_on_to_become_memories(server, secrets, tmp_path):
+    # /capture only stores. Without /extract a conversation never became a
+    # memory: on 24 Oct one sat unprocessed in production.
+    p = provider(server, tmp_path, secrets=secrets)
+    p.sync_turn("We ship on Tuesdays now.", "Noted: Tuesdays.")
+    p.flush()
+    assert server.paths() == ["/capture/", "/extract/"]
+    (req,) = server.sent("/extract/")
+    assert req["body"] == {"session_id": "s1", "source": "hermes"}  # the API key names the user
+
+
+def test_a_capture_conxt_already_had_is_not_extracted_again(server, secrets, tmp_path):
+    server.replies["/capture/"] = (200, {"status": "already_processed", "session_id": "s1"})
+    p = provider(server, tmp_path, secrets=secrets)
+    p.sync_turn("We ship on Tuesdays now.", "Noted: Tuesdays.")
+    p.flush()
+    assert server.paths() == ["/capture/"]
+
+
+def test_a_slow_extraction_does_not_hold_up_the_flush(server, secrets, tmp_path, monkeypatch):
+    # Extraction takes 9-45s in production; the provider asks and moves on.
+    monkeypatch.setattr(conxt, "EXTRACT_WAIT_S", 0.2)
+    server.delays["/extract/"] = 2.0
+    p = provider(server, tmp_path, secrets=secrets)
+    p.sync_turn("We ship on Tuesdays now.", "Noted: Tuesdays.")
+    started = time.monotonic()
+    p.flush()
+    assert time.monotonic() - started < 1.5
+    assert p._buffer == [] and server.paths() == ["/capture/", "/extract/"]
+
+
+def test_a_refused_extraction_still_counts_the_conversation_as_sent(server, secrets, tmp_path):
+    server.replies["/extract/"] = (422, {"detail": "user_id required"})
+    p = provider(server, tmp_path, secrets=secrets)
+    p.sync_turn("We ship on Tuesdays now.", "Noted: Tuesdays.")
+    p.flush()
+    p.flush()
+    assert p._buffer == [] and len(server.sent("/capture/")) == 1
+
+
+def test_shutdown_never_sends_a_batch_the_session_end_flush_is_sending(server, secrets, tmp_path):
+    # On 24 Oct the same conversation reached Conxt twice, 0.7s apart.
+    server.delays["/capture/"] = 3.0
+    p = provider(server, tmp_path, secrets=secrets)
+    p.sync_turn("We ship on Tuesdays now.", "Noted: Tuesdays.")
+    p.on_session_end([])
+    time.sleep(0.2)  # the session-end flush is now waiting on Conxt
+    p.shutdown()
+    wait_for_flush(p)
+    assert len(server.sent("/capture/")) == 1
 
 
 def test_a_long_session_is_sent_in_batches_conxt_accepts(server, secrets, tmp_path):
@@ -205,19 +265,23 @@ def test_a_long_session_is_sent_in_batches_conxt_accepts(server, secrets, tmp_pa
     with p._lock:  # 60 messages, one far over the per-message limit
         p._buffer = [{"role": "user", "content": "x" * 25_000 if i == 0 else f"m{i}", "ts": i} for i in range(60)]
     p.flush()
-    batches = [r["body"]["raw_turns"] for r in server.requests]
+    batches = [r["body"]["raw_turns"] for r in server.sent("/capture/")]
     assert [len(b) for b in batches] == [50, 10]
     assert len(batches[0][0]["content"]) == conxt.CAPTURE_MAX_TURN_CHARS
     for b in batches:
         assert sum(len(t["content"]) for t in b) <= conxt.CAPTURE_MAX_TOTAL_CHARS
 
 
-def test_capture_starts_on_its_own_every_twenty_exchanges(server, secrets, tmp_path):
+def test_capture_starts_on_its_own_every_five_exchanges(server, secrets, tmp_path):
+    # At 40 messages a short conversation lived only in memory until the
+    # session ended, and closing the terminal window lost it.
     p = provider(server, tmp_path, secrets=secrets)
-    for i in range(20):
+    for i in range(4):
         p.sync_turn(f"question {i}", f"answer {i}")
+    assert server.requests == []
+    p.sync_turn("question 4", "answer 4")
     wait_for_flush(p)
-    assert server.paths() == ["/capture/"]
+    assert server.paths() == ["/capture/", "/extract/"]
 
 
 def test_nothing_is_captured_from_a_cron_run(server, secrets, tmp_path):
@@ -252,7 +316,7 @@ def test_whatever_is_left_is_sent_at_shutdown(server, secrets, tmp_path):
     p = provider(server, tmp_path, secrets=secrets)
     p.sync_turn("Our staging URL changed.", "Got it.")
     p.shutdown()
-    assert server.paths() == ["/capture/"]
+    assert server.paths() == ["/capture/", "/extract/"]
 
 
 # -- writes --------------------------------------------------------------------

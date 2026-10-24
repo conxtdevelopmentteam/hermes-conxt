@@ -18,7 +18,7 @@ what the agent remembers for a team:
 | When | What happens |
 |---|---|
 | Before each turn | Your message is sent to Conxt and the matching memories come back as context: your own, plus your team's approved ones if a team is set. Greetings and one-word replies are skipped. |
-| After the conversation | Turns are buffered locally and sent to Conxt in batches: when the session ends, before Hermes compresses the context, when you switch session, at shutdown, and every 20 exchanges. Conxt extracts memories from them. |
+| After the conversation | Turns are buffered locally and sent to Conxt in batches: when the session ends, before Hermes compresses the context, when you switch session, at shutdown, and every 5 exchanges. Conxt then extracts memories from each batch. |
 | When Hermes's built-in memory adds an entry | The same text is saved to your Conxt memory. |
 | When the agent chooses | `conxt_search` looks something up. `conxt_remember` saves a personal memory. `conxt_propose` proposes a team memory, and only exists when a team is set. |
 

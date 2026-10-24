@@ -10,9 +10,9 @@ What it does, and when:
   the memories that match come back as context for the turn: the person's own,
   plus the team's approved memories when a team is configured.
 - After the conversation, capture. Turns are buffered on the instance and sent
-  to /capture at the session's end, before compression, when the session
-  switches, at shutdown, and every 20 exchanges, in batches Conxt accepts.
-  Conxt extracts memories from them.
+  to /capture every 5 exchanges, at the session's end, before compression,
+  when the session switches and at shutdown, in batches Conxt accepts. Each
+  stored batch is then handed to /extract, which turns it into memories.
 - On request, three tools: conxt_search, conxt_remember (a personal memory) and
   conxt_propose (a team memory, which waits for a person's approval in Conxt;
   an API key cannot approve its own proposal).
@@ -46,8 +46,13 @@ DEFAULT_BASE_URL = "https://mcp.conxt.dev"
 CONFIG_FILE = "conxt.json"
 SOURCE = "hermes"
 
-RECALL_TIMEOUT_S = 5.0   # Hermes abandons a prefetch after 8s; leave it room.
+# Hermes abandons a prefetch after 8s. 5s was too tight: the first recall of a
+# live session on 24 Oct took longer and the turn went without memory.
+RECALL_TIMEOUT_S = 7.0
 WRITE_TIMEOUT_S = 20.0
+# Extraction runs an LLM and takes 9-45s. Conxt finishes a request after the
+# client hangs up, so the provider asks and does not wait for the answer.
+EXTRACT_WAIT_S = 3.0
 RECALL_LIMIT = 8
 QUERY_CHARS = 500        # Conxt embeds only the first 500 characters.
 
@@ -56,7 +61,9 @@ QUERY_CHARS = 500        # Conxt embeds only the first 500 characters.
 CAPTURE_MAX_TURNS = 50
 CAPTURE_MAX_TURN_CHARS = 10_000
 CAPTURE_MAX_TOTAL_CHARS = 100_000
-FLUSH_EVERY_MESSAGES = 40
+# Every 5 exchanges. At 40, a short conversation lived only in this process
+# until the session ended, and closing the terminal window lost it.
+FLUSH_EVERY_MESSAGES = 10
 BUFFER_CAP_MESSAGES = 400  # while Conxt is unreachable; oldest dropped first
 
 MEMORY_TYPES = ("decision", "preference", "entity", "open_question", "coding_rule", "tool_choice", "workflow")
@@ -78,13 +85,14 @@ def _read_config(home: Path) -> dict[str, Any]:
 class ConxtError(RuntimeError):
     """A request Conxt refused or could not answer, with its reason."""
 
-    def __init__(self, message: str, status: int = 0):
+    def __init__(self, message: str, status: int = 0, sent: bool = False):
         super().__init__(message)
         self.status = status
+        self.sent = sent  # the request reached Conxt; only the answer is missing
 
 
 class _Client:
-    """The four Conxt routes this provider uses, over HTTPS with the API key."""
+    """The Conxt routes this provider uses, over HTTPS with the API key."""
 
     def __init__(self, api_key: str, base_url: str):
         self._api_key = api_key
@@ -98,6 +106,8 @@ class _Client:
                 f"{self.base_url}{path}", json=body, timeout=timeout,
                 headers={"Authorization": f"Bearer {self._api_key}", "User-Agent": "hermes-conxt"},
             )
+        except requests.ReadTimeout as exc:
+            raise ConxtError(f"Conxt did not answer {path} in time", sent=True) from exc
         except requests.RequestException as exc:
             raise ConxtError(f"Conxt could not be reached: {exc.__class__.__name__}") from exc
         try:
@@ -118,6 +128,17 @@ class _Client:
 
     def capture(self, turns: list[dict[str, Any]], timeout: float = WRITE_TIMEOUT_S) -> dict[str, Any]:
         return self._post("/capture/", {"source": SOURCE, "raw_turns": turns}, timeout) or {}
+
+    def extract(self, session_id: str, timeout: float = EXTRACT_WAIT_S) -> None:
+        """Ask Conxt to turn a stored capture into memories. /capture only
+        stores; without this call a conversation never becomes memory. An
+        answer that does not arrive in time is fine: the request was sent,
+        and Conxt also retries sessions it holds unextracted."""
+        try:
+            self._post("/extract/", {"session_id": session_id, "source": SOURCE}, timeout)
+        except ConxtError as exc:
+            if not exc.sent:
+                raise
 
     def remember(self, content: str, memory_type: str) -> dict[str, Any]:
         # /import is Conxt's personal write: it redacts secrets and reinforces
@@ -170,6 +191,9 @@ class ConxtMemoryProvider(MemoryProvider):
         self._writes = False
         self._session_id = ""
         self._lock = threading.Lock()
+        # One flush at a time. Shutdown flushed while the session-end flush was
+        # still sending, and the same batch went to Conxt twice.
+        self._flush_lock = threading.Lock()
         self._buffer: list[dict[str, Any]] = []
         self._flusher: Optional[threading.Thread] = None
         self._last_count: Optional[int] = None
@@ -277,8 +301,9 @@ class ConxtMemoryProvider(MemoryProvider):
     def shutdown(self) -> None:
         if self._flusher and self._flusher.is_alive():
             self._flusher.join(timeout=2.0)
-        # Hermes waits about 5s for shutdown, so the last batch gets a short timeout.
-        self.flush(timeout=3.0)
+        # Hermes gives shutdown about 30s in all, shared with everything else,
+        # so the last batch gets short timeouts.
+        self.flush(timeout=3.0, wait=1.0)
 
     def _flush_in_background(self) -> None:
         if not self._writes or not self._buffer:
@@ -288,19 +313,31 @@ class ConxtMemoryProvider(MemoryProvider):
         self._flusher = spawn_context_thread(self.flush, name="conxt-capture")
         self._flusher.start()
 
-    def flush(self, timeout: float = WRITE_TIMEOUT_S) -> None:
-        """Send buffered turns to Conxt in batches it accepts. A batch is removed
-        from the buffer once Conxt has it, or when Conxt refuses it as invalid;
-        if Conxt cannot be reached, it stays for the next flush."""
+    def flush(self, timeout: float = WRITE_TIMEOUT_S, wait: Optional[float] = None) -> None:
+        """Send buffered turns to Conxt in batches it accepts, and ask for each
+        stored batch to be extracted. A batch is removed from the buffer once
+        Conxt has it, or when Conxt refuses it as invalid; if Conxt cannot be
+        reached, it stays for the next flush. If another flush is running and
+        does not finish within `wait` seconds, this one sends nothing."""
         if not self._client:
             return
+        if not self._flush_lock.acquire(timeout=timeout if wait is None else wait):
+            return
+        try:
+            self._flush_batches(timeout)
+        finally:
+            self._flush_lock.release()
+
+    def _flush_batches(self, timeout: float) -> None:
+        assert self._client is not None
         while True:
             with self._lock:
                 batch = _next_batch(self._buffer)
             if not batch:
                 return
+            stored = None
             try:
-                self._client.capture(batch, timeout=timeout)
+                stored = self._client.capture(batch, timeout=timeout)
             except ConxtError as exc:
                 if 400 <= exc.status < 500 and exc.status not in (401, 403, 408, 429):
                     logger.warning("Conxt refused a capture; it was dropped: %s", exc)
@@ -309,6 +346,12 @@ class ConxtMemoryProvider(MemoryProvider):
                     return
             with self._lock:
                 del self._buffer[: len(batch)]
+            if stored and stored.get("status") == "captured" and stored.get("session_id"):
+                logger.info("Conxt: sent %d messages", len(batch))
+                try:
+                    self._client.extract(str(stored["session_id"]), timeout=min(timeout, EXTRACT_WAIT_S))
+                except ConxtError as exc:
+                    logger.info("Conxt extraction not requested; a later one retries it: %s", exc)
 
     # -- built-in memory mirror ----------------------------------------------
 
