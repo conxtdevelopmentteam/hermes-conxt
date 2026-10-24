@@ -1,0 +1,11 @@
+name: conxt
+version: 0.1.0
+description: "Conxt governed memory: recall before each turn, capture after it, team memory through approval."
+requires_hermes: ">=0.21.6"
+requires_env:
+  - name: CONXT_API_KEY
+    description: "Conxt API key (create one in your Conxt dashboard)"
+    url: "https://conxt.dev"
+    secret: true
+hooks:
+  - on_session_end
