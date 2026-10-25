@@ -30,19 +30,22 @@ person, so unattended runs cannot hang.
 ## Requirements
 
 - Hermes Agent 0.21.6 or later.
-- A Conxt account. Free covers everything here except team memory, which needs the Team
-  plan. Create a key at [conxt.dev/connect-ide](https://conxt.dev/connect-ide).
+- A Conxt API key. During the beta any free Conxt account can create one; after it, keys
+  need a paid plan. Team memory needs the Team plan. Create the key from the **Hermes** card
+  at [conxt.dev/connect-ide](https://conxt.dev/connect-ide): each tool gets its own key, so
+  you can see what Hermes reads and revoke it without touching your other tools.
 
 ## Install and set up
 
-Once the plugin is in the Hermes catalog:
+The plugin is in the [Hermes plugin catalog](https://github.com/NousResearch/hermes-agent/tree/main/plugin-catalog):
 
 ```bash
 hermes plugins install conxt
 hermes memory setup        # choose "conxt", paste your API key, optionally a team id
 ```
 
-Before that, install it by hand into your profile:
+To run the latest commit instead of the catalog's pinned version, install it by hand into
+your profile:
 
 ```bash
 git clone https://github.com/conxtdevelopmentteam/hermes-conxt "$HERMES_HOME/plugins/conxt"
