@@ -30,8 +30,8 @@ person, so unattended runs cannot hang.
 ## Requirements
 
 - Hermes Agent 0.21.6 or later.
-- A Conxt account on a plan that includes API keys (Pro, Developer or Team). Create a key at
-  [conxt.dev/connect-ide](https://conxt.dev/connect-ide).
+- A Conxt account. Free covers everything here except team memory, which needs the Team
+  plan. Create a key at [conxt.dev/connect-ide](https://conxt.dev/connect-ide).
 
 ## Install and set up
 
