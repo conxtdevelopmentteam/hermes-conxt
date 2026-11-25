@@ -1,5 +1,7 @@
 # Conxt memory for Hermes Agent
 
+![Conxt: long-term memory your team can trust](docs/banner.png)
+
 **Long-term memory for [Hermes Agent](https://github.com/NousResearch/hermes-agent) that a team can trust.**
 Hermes remembers what you decided across sessions, and nothing reaches your team's memory
 until a person approves it.
