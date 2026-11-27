@@ -232,6 +232,9 @@ class _Client:
                 return None
         except ConxtError:
             raise
+        except _StreamCut as exc:
+            reason = "did not finish its answer in time" if str(exc) == "deadline" else "sent a line too long to read"
+            raise ConxtError(f"Conxt {reason} for {tool}{unknown or ''}.", sent=True) from exc
         except (requests.RequestException, urllib3.exceptions.HTTPError, OSError) as exc:
             # Raw stream reads raise urllib3's own errors (a stall is
             # ReadTimeoutError, a drop ProtocolError), not requests' (Codex
@@ -252,12 +255,22 @@ class _Client:
 MAX_STREAM_LINE = 1_000_000  # bytes; an MCP answer line is far smaller
 
 
+class _StreamCut(Exception):
+    """A streamed answer stopped before it ended: the deadline passed, or a
+    line outgrew MAX_STREAM_LINE. Never read as the stream's natural end,
+    so a partial event is not mistaken for a whole one (CodeRabbit on #5)."""
+
+
 def _stream_lines(resp, deadline: float):
     """The lines of a streamed body, each handed over as soon as it has
     arrived. requests' iter_lines reads in 512-byte blocks and can sit on a
     short answer while the server keeps the stream open (Codex on #5), so
     this reads whatever bytes are there (read1), a byte at a time where an
-    older urllib3 has no read1."""
+    older urllib3 has no read1.
+
+    Lines end at CRLF, LF or a bare CR, as SSE allows (Codex on #5); a CR
+    at the end of what has arrived waits for the next read, in case it is
+    the first half of a CRLF."""
     raw = resp.raw
     # Raw reads skip requests' decompression, and requests asks for gzip;
     # a compressed stream would parse as nothing (Codex on #5).
@@ -269,13 +282,16 @@ def _stream_lines(resp, deadline: float):
         if not chunk:
             break
         pending += chunk
-        # Bytes that never form a line must not hold the run past its
-        # deadline or grow without bound (CodeRabbit on #5).
-        if time.monotonic() > deadline or len(pending) > MAX_STREAM_LINE:
-            return
-        while b"\n" in pending:
-            line, pending = pending.split(b"\n", 1)
-            yield line.rstrip(b"\r").decode("utf-8", "replace")
+        while True:
+            cut = re.search(rb"\r\n|\r(?!$)|\n", pending)
+            if not cut:
+                break
+            yield pending[:cut.start()].decode("utf-8", "replace")
+            pending = pending[cut.end():]
+        if time.monotonic() > deadline:
+            raise _StreamCut("deadline")
+        if len(pending) > MAX_STREAM_LINE:
+            raise _StreamCut("line too long")
     if pending:
         yield pending.rstrip(b"\r").decode("utf-8", "replace")
 
@@ -666,7 +682,12 @@ def _whole(value: Any) -> Optional[int]:
     if isinstance(value, float):
         return int(value) if value.is_integer() and value >= 0 else None
     if isinstance(value, str) and re.fullmatch(r"[0-9]+", value.strip()):
-        return int(value.strip())   # "²" passes isdigit() but not int() (CodeRabbit on #5)
+        # "²" passes isdigit() but not int(), and int() refuses more than
+        # 4,300 digits (CodeRabbit on #5): both become the validation error.
+        try:
+            return int(value.strip())
+        except ValueError:
+            return None
     return None
 
 

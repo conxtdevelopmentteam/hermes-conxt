@@ -508,22 +508,57 @@ def test_progress_events_that_never_end_in_the_answer_stop_at_the_deadline():
         assert time.monotonic() - started < 2
 
 
-def test_bytes_that_never_form_a_line_stop_at_the_deadline_and_the_cap():
-    class Raw:
-        def read1(self, n):
+class _Chunks:
+    """A response whose raw body hands over the given chunks, then forever
+    more `tail` if set, else nothing (the end of the stream)."""
+    def __init__(self, chunks, tail=None):
+        self.raw = self
+        self.decode_content = False
+        self._chunks, self._tail = list(chunks), tail
+
+    def read1(self, n):
+        if self._chunks:
+            return self._chunks.pop(0)
+        if self._tail is not None:
             time.sleep(0.01)
-            return b"x" * 4096
-    class Resp:
-        raw = Raw()
+            return self._tail
+        return b""
+
+
+def test_bytes_that_never_form_a_line_stop_at_the_deadline_and_the_cap():
     started = time.monotonic()
-    assert list(conxt._stream_lines(Resp(), time.monotonic() + 0.3)) == []
+    with pytest.raises(conxt._StreamCut):
+        list(conxt._stream_lines(_Chunks([], tail=b"x" * 4096), time.monotonic() + 0.3))
     assert time.monotonic() - started < 2
-    assert time.monotonic() - started < 2
+
+
+def test_a_cut_after_a_complete_data_line_is_not_read_as_an_answer():
+    """CodeRabbit on #5: a valid data line then an endless unterminated line
+    was read as a finished event, and its answer accepted."""
+    good = b'data: {"jsonrpc":"2.0","id":2,"result":{"content":[{"type":"text","text":"x"}]}}\n'
+    lines = conxt._stream_lines(_Chunks([good], tail=b"y" * 65536), time.monotonic() + 30)
+    with pytest.raises(conxt._StreamCut):
+        list(conxt._sse_events(lines, time.monotonic() + 30))
+
+
+def test_lines_end_at_cr_lf_or_crlf_even_split_across_reads():
+    """Codex on #5: bare CR line endings, which SSE allows, were never split."""
+    chunks = [b"data: a\r", b"\ndata: b\rdata: c\n", b"\r", b"\n"]
+    assert list(conxt._stream_lines(_Chunks(chunks), time.monotonic() + 5)) == [
+        "data: a", "data: b", "data: c", ""]
+
+
+def test_cr_delimited_events_are_read():
+    body = (b'data: {"jsonrpc":"2.0","method":"notifications/progress"}\r\r'
+            b'data: {"jsonrpc":"2.0","id":2,"result":{"content":[]}}\r\r')
+    events = list(conxt._sse_events(conxt._stream_lines(_Chunks([body]), time.monotonic() + 5),
+                                    time.monotonic() + 5))
+    assert conxt._response_for(events, 2) == {"jsonrpc": "2.0", "id": 2, "result": {"content": []}}
 
 
 def test_fractional_or_negative_grades_are_refused_not_rounded(server, secrets, tmp_path):
     p = provider(server, tmp_path, secrets=secrets)
-    for bad in (3.9, -1, True, "2.5", "many", "²", "٣"):
+    for bad in (3.9, -1, True, "2.5", "many", "²", "٣", "9" * 5000):
         out = json.loads(p.handle_tool_call("conxt_finish_run", {"run_id": "r", "report": "x", "graded": bad}))
         assert "whole number" in out["error"], bad
     assert server.sent("/mcp/") == []
