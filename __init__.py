@@ -196,6 +196,7 @@ class _Client:
         """POST one JSON-RPC message. For a request, the response with its
         id (None if none came); for a notification, None."""
         import requests
+        import urllib3
 
         want = body.get("id")
         deadline = time.monotonic() + timeout
@@ -226,8 +227,15 @@ class _Client:
                 return _response_for(resp.json(), want)
             except ValueError:
                 return None
-        except requests.RequestException as exc:
-            raise ConxtError(f"Conxt's answer to {tool} was cut off: {exc.__class__.__name__}", sent=True) from exc
+        except ConxtError:
+            raise
+        except (requests.RequestException, urllib3.exceptions.HTTPError, OSError) as exc:
+            # Raw stream reads raise urllib3's own errors (a stall is
+            # ReadTimeoutError, a drop ProtocolError), not requests' (Codex
+            # on #5). Either way the call may or may not have run.
+            raise ConxtError(f"Conxt's answer to {tool} was cut off ({exc.__class__.__name__}); "
+                             "it may or may not have run. Check in Conxt before running it again.",
+                             sent=True) from exc
         finally:
             resp.close()
 

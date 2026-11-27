@@ -578,3 +578,42 @@ def test_a_compressed_streamed_answer_is_decompressed(server, secrets, tmp_path)
         assert client.mcp_tool("start_run", {"project": "f"}, timeout=3.0) == "unzipped"
     finally:
         srv.shutdown()
+
+
+def test_a_stream_that_stalls_mid_answer_is_reported_not_raised():
+    """Codex on #5: a stalled raw read raised urllib3's ReadTimeoutError,
+    which escaped handle_tool_call instead of becoming the tool's error."""
+    class Stall(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.0"
+
+        def do_POST(self):
+            body = json.loads(self.rfile.read(int(self.headers["Content-Length"])) or b"{}")
+            if body.get("id") != 2:
+                data = b'{"jsonrpc":"2.0","id":1,"result":{}}'
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+                return
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.end_headers()
+            self.wfile.write(b": ping\n\n")
+            self.wfile.flush()
+            time.sleep(3)   # longer than the client's read timeout
+
+        def log_message(self, *args):
+            pass
+
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), Stall)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    try:
+        p = conxt.ConxtMemoryProvider()
+        p._client = conxt._Client("k", f"http://127.0.0.1:{srv.server_address[1]}")
+        original = p._client.mcp_tool
+        p._client.mcp_tool = lambda tool, args, timeout=1.0: original(tool, args, timeout=1.0)
+        out = json.loads(p.handle_tool_call("conxt_finish_run", {"run_id": "r", "report": "x"}))
+        assert "may or may not have run" in out["error"]
+    finally:
+        srv.shutdown()
