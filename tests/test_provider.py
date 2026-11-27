@@ -551,3 +551,30 @@ def test_a_short_answer_on_a_stream_left_open_is_read_at_once():
         assert time.monotonic() - started < 2.0
     finally:
         srv.shutdown()
+
+
+def test_a_compressed_streamed_answer_is_decompressed(server, secrets, tmp_path):
+    """Codex on #5: raw reads skip decompression, and requests asks for gzip."""
+    import gzip
+    body = gzip.compress(_sse('{"jsonrpc":"2.0","id":2,"result":{"content":[{"type":"text","text":"unzipped"}]}}').encode())
+
+    class Gz(BaseHTTPRequestHandler):
+        def do_POST(self):
+            self.rfile.read(int(self.headers["Content-Length"]))
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Content-Encoding", "gzip")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *args):
+            pass
+
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), Gz)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    try:
+        client = conxt._Client("k", f"http://127.0.0.1:{srv.server_address[1]}")
+        assert client.mcp_tool("start_run", {"project": "f"}, timeout=3.0) == "unzipped"
+    finally:
+        srv.shutdown()

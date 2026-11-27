@@ -245,6 +245,9 @@ def _stream_lines(resp):
     this reads whatever bytes are there (read1), a byte at a time where an
     older urllib3 has no read1."""
     raw = resp.raw
+    # Raw reads skip requests' decompression, and requests asks for gzip;
+    # a compressed stream would parse as nothing (Codex on #5).
+    raw.decode_content = True
     read = (lambda: raw.read1(4096)) if hasattr(raw, "read1") else (lambda: raw.read(1))
     pending = b""
     while True:
