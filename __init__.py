@@ -215,7 +215,7 @@ class _Client:
             if want is None:
                 return None
             if "text/event-stream" in (resp.headers.get("content-type") or ""):
-                for event in _sse_events(resp.iter_lines(decode_unicode=True), deadline):
+                for event in _sse_events(_stream_lines(resp), deadline):
                     found = _response_for(event, want)
                     if found is not None:
                         return found
@@ -238,6 +238,27 @@ class _Client:
         return self._post(f"/teams/{team_id}/memories/create", body, WRITE_TIMEOUT_S) or {}
 
 
+def _stream_lines(resp):
+    """The lines of a streamed body, each handed over as soon as it has
+    arrived. requests' iter_lines reads in 512-byte blocks and can sit on a
+    short answer while the server keeps the stream open (Codex on #5), so
+    this reads whatever bytes are there (read1), a byte at a time where an
+    older urllib3 has no read1."""
+    raw = resp.raw
+    read = (lambda: raw.read1(4096)) if hasattr(raw, "read1") else (lambda: raw.read(1))
+    pending = b""
+    while True:
+        chunk = read()
+        if not chunk:
+            break
+        pending += chunk
+        while b"\n" in pending:
+            line, pending = pending.split(b"\n", 1)
+            yield line.rstrip(b"\r").decode("utf-8", "replace")
+    if pending:
+        yield pending.rstrip(b"\r").decode("utf-8", "replace")
+
+
 def _sse_events(lines, deadline: float):
     """The parsed data of each server-sent event, as it arrives. An event's
     data lines are joined with newlines before parsing, as SSE specifies;
@@ -248,14 +269,18 @@ def _sse_events(lines, deadline: float):
             continue
         if line == "":
             if data:
+                # A complete event is always handed over, however late:
+                # the deadline stops the waiting, never an answer already here.
                 try:
                     yield json.loads("\n".join(data))
                 except ValueError:
                     pass
                 data = []
+            elif time.monotonic() > deadline:
+                return
         elif line.startswith("data:"):
             data.append(line[6:] if line[5:6] == " " else line[5:])
-        if time.monotonic() > deadline:
+        elif time.monotonic() > deadline and not data:
             return
     if data:
         try:

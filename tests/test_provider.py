@@ -506,3 +506,48 @@ def test_fractional_or_negative_grades_are_refused_not_rounded(server, secrets, 
         assert "whole number" in out["error"], bad
     assert server.sent("/mcp/") == []
     assert conxt._whole(4.0) == 4 and conxt._whole("6") == 6 and conxt._whole(None) == 0
+
+
+def test_a_short_answer_on_a_stream_left_open_is_read_at_once():
+    """Codex on #5: a short event on a stream the server keeps open sat in
+    requests' 512-byte read buffer until the deadline, then was thrown away."""
+    class Open(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.0"
+
+        def do_POST(self):
+            body = json.loads(self.rfile.read(int(self.headers["Content-Length"])) or b"{}")
+            if body.get("id") != 2:
+                data = b'{"jsonrpc":"2.0","id":1,"result":{}}'
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+                return
+            # A plain stream: no Content-Length, no chunking, left open.
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.wfile.write(b'data: {"jsonrpc":"2.0","id":2,"result":{"content":[{"type":"text","text":"fast"}]}}\n\n')
+            self.wfile.flush()
+            for _ in range(20):   # heartbeats, well past the client's deadline
+                time.sleep(0.3)
+                try:
+                    self.wfile.write(b": ping\n\n")
+                    self.wfile.flush()
+                except OSError:
+                    return
+
+        def log_message(self, *args):
+            pass
+
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), Open)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    try:
+        client = conxt._Client("k", f"http://127.0.0.1:{srv.server_address[1]}")
+        started = time.monotonic()
+        assert client.mcp_tool("start_run", {"project": "f"}, timeout=3.0) == "fast"
+        assert time.monotonic() - started < 2.0
+    finally:
+        srv.shutdown()
