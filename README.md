@@ -116,6 +116,7 @@ authenticated with your API key, and to nothing else.
 | **Capture** | The user and assistant messages, up to 10,000 characters each. Tool calls and tool results are not sent, but anything the assistant repeats in its reply is, such as file paths, command output or code it quotes. Conxt redacts secrets it recognises before storing memories. |
 | **Saves and proposals** | The memory's text, its type and a title. |
 | **Mirrored memory writes** | The text of each entry Hermes's built-in memory adds. |
+| **Agent folders** | Only when the agent calls one of the four agent-folder tools, including in scheduled (cron) runs: the folder name, the whole AGENT.md it saves, and each run's report, lessons, how many earlier results it graded and how many held up, and what it carries to the next run. Conxt screens these for secrets before storing them. |
 
 No telemetry. The plugin runs no shell commands, starts no long-running processes (only
 short-lived threads that send captures), and stores one file in your profile,

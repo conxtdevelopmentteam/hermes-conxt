@@ -47,7 +47,7 @@ from agent.secret_scope import get_secret
 
 logger = logging.getLogger(__name__)
 
-VERSION = "0.2.0"
+VERSION = "0.2.1"
 DEFAULT_BASE_URL = "https://mcp.conxt.dev"
 CONFIG_FILE = "conxt.json"
 SOURCE = "hermes"
@@ -159,43 +159,91 @@ class _Client:
         """Call one tool on Conxt's MCP server and return its text.
 
         Agent folders exist only as MCP tools (conxt-engine #434). Conxt's
-        server answers a call without a session, but a session id is
-        carried if it hands one out, and a streamed (SSE) answer is read
-        too, so a change on the server side does not break the plugin."""
-        import requests
+        server answers a call with plain JSON and no session today; a session
+        id is carried if it hands one out, and a streamed (SSE) answer is
+        read as it arrives, so a change on the server side does not break
+        the plugin or leave a cron run waiting on a stream that stays open.
 
+        A call whose answer never arrives is an error, never an empty
+        success, and is not sent again: finish_run is not safe to repeat
+        (review of hermes-conxt #4)."""
         url = f"{self.base_url}/mcp/"
         headers = {"Authorization": f"Bearer {self._api_key}", "User-Agent": "hermes-conxt",
                    "Content-Type": "application/json", "Accept": "application/json, text/event-stream"}
 
-        def send(body: dict[str, Any]) -> Any:
-            try:
-                resp = requests.post(url, json=body, headers=headers, timeout=timeout)
-            except requests.ReadTimeout as exc:
-                raise ConxtError(f"Conxt did not answer {tool} in time", sent=True) from exc
-            except requests.RequestException as exc:
-                raise ConxtError(f"Conxt could not be reached: {exc.__class__.__name__}") from exc
+        self._mcp_send(url, headers, {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
+            "protocolVersion": "2025-03-26", "capabilities": {},
+            "clientInfo": {"name": "hermes-conxt", "version": VERSION}}}, tool, timeout)
+        self._mcp_send(url, headers, {"jsonrpc": "2.0", "method": "notifications/initialized"}, tool, timeout)
+        msg = self._mcp_send(url, headers, {"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                                            "params": {"name": tool, "arguments": arguments}}, tool, timeout)
+        if msg is None:
+            raise ConxtError(f"Conxt sent no answer to {tool}; it may or may not have run. "
+                             "Check in Conxt before running it again.", sent=True)
+        if msg.get("error"):
+            err = msg["error"]
+            raise ConxtError(f"Conxt could not run {tool}: {err.get('message') if isinstance(err, dict) else err}")
+        result = msg.get("result")
+        if not isinstance(result, dict):
+            raise ConxtError(f"Conxt's answer to {tool} had no result; it may or may not have run.", sent=True)
+        text = "\n".join(c.get("text", "") for c in result.get("content") or [] if isinstance(c, dict)).strip()
+        if result.get("isError"):
+            raise ConxtError(text or f"Conxt could not run {tool}")
+        return text
+
+    def _mcp_send(self, url: str, headers: dict[str, str], body: dict[str, Any], tool: str,
+                  timeout: float) -> Optional[dict[str, Any]]:
+        """POST one JSON-RPC message. For a request, the response with its
+        id (None if none came); for a notification, None."""
+        import requests
+        import urllib3
+
+        want = body.get("id")
+        deadline = time.monotonic() + timeout
+        # Only a tool call can have run without an answer arriving; say so.
+        unknown = ("; it may or may not have run. Check in Conxt before running it again"
+                   if body.get("method") == "tools/call" else "")
+        try:
+            resp = requests.post(url, json=body, headers=headers, timeout=timeout, stream=True)
+        except requests.ReadTimeout as exc:
+            raise ConxtError(f"Conxt did not answer {tool} in time{unknown}", sent=True) from exc
+        except requests.RequestException as exc:
+            raise ConxtError(f"Conxt could not be reached: {exc.__class__.__name__}") from exc
+        try:
             if resp.status_code in (401, 403):
                 raise ConxtError("Conxt refused the API key. Check CONXT_API_KEY.", resp.status_code)
             if not resp.ok:
                 raise ConxtError(f"Conxt refused {tool} ({resp.status_code})", resp.status_code)
             if resp.headers.get("mcp-session-id"):
                 headers["Mcp-Session-Id"] = resp.headers["mcp-session-id"]
-            return _jsonrpc_message(resp)
-
-        send({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
-            "protocolVersion": "2025-03-26", "capabilities": {},
-            "clientInfo": {"name": "hermes-conxt", "version": VERSION}}})
-        send({"jsonrpc": "2.0", "method": "notifications/initialized"})
-        msg = send({"jsonrpc": "2.0", "id": 2, "method": "tools/call",
-                    "params": {"name": tool, "arguments": arguments}}) or {}
-        if msg.get("error"):
-            raise ConxtError(f"Conxt could not run {tool}: {msg['error'].get('message') or msg['error']}")
-        result = msg.get("result") or {}
-        text = "\n".join(c.get("text", "") for c in result.get("content") or [] if isinstance(c, dict)).strip()
-        if result.get("isError"):
-            raise ConxtError(text or f"Conxt could not run {tool}")
-        return text
+            if want is None:
+                return None
+            if "text/event-stream" in (resp.headers.get("content-type") or ""):
+                for event in _sse_events(_stream_lines(resp, deadline), deadline):
+                    found = _response_for(event, want)
+                    if found is not None:
+                        return found
+                if time.monotonic() > deadline:
+                    raise ConxtError(f"Conxt did not answer {tool} in time{unknown}", sent=True)
+                return None
+            try:
+                return _response_for(resp.json(), want)
+            except ValueError:
+                return None
+        except ConxtError:
+            raise
+        except _StreamCut as exc:
+            reason = "did not finish its answer in time" if str(exc) == "deadline" else "sent a line too long to read"
+            raise ConxtError(f"Conxt {reason} for {tool}{unknown or ''}.", sent=True) from exc
+        except (requests.RequestException, urllib3.exceptions.HTTPError, OSError) as exc:
+            # Raw stream reads raise urllib3's own errors (a stall is
+            # ReadTimeoutError, a drop ProtocolError), not requests' (Codex
+            # on #5). Either way the call may or may not have run.
+            raise ConxtError(f"Conxt's answer to {tool} was cut off ({exc.__class__.__name__}); "
+                             "it may or may not have run. Check in Conxt before running it again.",
+                             sent=True) from exc
+        finally:
+            resp.close()
 
     def propose(self, team_id: str, content: str, memory_type: str, title: str) -> dict[str, Any]:
         # A write to a team with an API key is stored as pending; a person on
@@ -204,24 +252,89 @@ class _Client:
         return self._post(f"/teams/{team_id}/memories/create", body, WRITE_TIMEOUT_S) or {}
 
 
-def _jsonrpc_message(resp) -> Any:
-    """The JSON-RPC message in an MCP answer: a JSON body, or the last data
-    line of a server-sent-events body."""
-    if "text/event-stream" in (resp.headers.get("content-type") or ""):
-        found = None
-        for line in resp.text.splitlines():
-            if line.startswith("data:"):
+MAX_STREAM_LINE = 1_000_000  # bytes; an MCP answer line is far smaller
+
+
+class _StreamCut(Exception):
+    """A streamed answer stopped before it ended: the deadline passed, or a
+    line outgrew MAX_STREAM_LINE. Never read as the stream's natural end,
+    so a partial event is not mistaken for a whole one (CodeRabbit on #5)."""
+
+
+def _stream_lines(resp, deadline: float):
+    """The lines of a streamed body, each handed over as soon as it has
+    arrived. requests' iter_lines reads in 512-byte blocks and can sit on a
+    short answer while the server keeps the stream open (Codex on #5), so
+    this reads whatever bytes are there (read1), a byte at a time where an
+    older urllib3 has no read1.
+
+    Lines end at CRLF, LF or a bare CR, as SSE allows (Codex on #5); a CR
+    at the end of what has arrived waits for the next read, in case it is
+    the first half of a CRLF."""
+    raw = resp.raw
+    # Raw reads skip requests' decompression, and requests asks for gzip;
+    # a compressed stream would parse as nothing (Codex on #5).
+    raw.decode_content = True
+    read = (lambda: raw.read1(4096)) if hasattr(raw, "read1") else (lambda: raw.read(1))
+    pending = b""
+    while True:
+        chunk = read()
+        if not chunk:
+            break
+        pending += chunk
+        while True:
+            cut = re.search(rb"\r\n|\r(?!$)|\n", pending)
+            if not cut:
+                break
+            yield pending[:cut.start()].decode("utf-8", "replace")
+            pending = pending[cut.end():]
+        if time.monotonic() > deadline:
+            raise _StreamCut("deadline")
+        if len(pending) > MAX_STREAM_LINE:
+            raise _StreamCut("line too long")
+    if pending:
+        yield pending.rstrip(b"\r").decode("utf-8", "replace")
+
+
+def _sse_events(lines, deadline: float):
+    """The parsed data of each server-sent event, as it arrives. An event's
+    data lines are joined with newlines before parsing, as SSE specifies;
+    reading stops once the deadline has passed."""
+    data: list[str] = []
+    for line in lines:
+        if line is None:
+            continue
+        if line == "":
+            if data:
+                # A complete event is always handed over, however late:
+                # the deadline stops the waiting, never an answer already here.
                 try:
-                    found = json.loads(line[5:].strip())
+                    yield json.loads("\n".join(data))
                 except ValueError:
-                    continue
-        return found
-    if not (resp.text or "").strip():
-        return None
-    try:
-        return resp.json()
-    except ValueError:
-        return None
+                    pass
+                data = []
+            # Checked after every event: progress events that never end in
+            # the answer must not keep the run waiting (CodeRabbit on #5).
+            if time.monotonic() > deadline:
+                return
+        elif line.startswith("data:"):
+            data.append(line[6:] if line[5:6] == " " else line[5:])
+        elif time.monotonic() > deadline and not data:
+            return
+    if data:
+        try:
+            yield json.loads("\n".join(data))
+        except ValueError:
+            pass
+
+
+def _response_for(message: Any, want: Any) -> Optional[dict[str, Any]]:
+    """The JSON-RPC response with id `want` in a message or a batch of them,
+    or None. Notifications and other ids are skipped."""
+    for m in (message if isinstance(message, list) else [message]):
+        if isinstance(m, dict) and m.get("id") == want and ("result" in m or "error" in m):
+            return m
+    return None
 
 
 def _schema(name: str, description: str, properties: dict, required: list[str]) -> dict[str, Any]:
@@ -548,13 +661,34 @@ class ConxtMemoryProvider(MemoryProvider):
         if isinstance(lessons, list):
             call["lessons"] = [str(x) for x in lessons][:5]
         for key in ("graded", "hits"):
-            try:
-                call[key] = max(0, int(args.get(key) or 0))
-            except (TypeError, ValueError):
-                return {"error": f"{key} must be a whole number"}
+            value = _whole(args.get(key))
+            if value is None:
+                return {"error": f"{key} must be a whole number of 0 or more"}
+            call[key] = value
         if args.get("carry") is not None:
             call["carry"] = args["carry"]
         return {"result": self._client.mcp_tool("finish_run", call)}
+
+
+def _whole(value: Any) -> Optional[int]:
+    """A count of 0 or more, or None. 3.9 is refused, not cut to 3: the
+    graded counts set an agent's track record (review of hermes-conxt #4)."""
+    if value is None or value == "":
+        return 0
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value if value >= 0 else None
+    if isinstance(value, float):
+        return int(value) if value.is_integer() and value >= 0 else None
+    if isinstance(value, str) and re.fullmatch(r"[0-9]+", value.strip()):
+        # "²" passes isdigit() but not int(), and int() refuses more than
+        # 4,300 digits (CodeRabbit on #5): both become the validation error.
+        try:
+            return int(value.strip())
+        except ValueError:
+            return None
+    return None
 
 
 def _next_batch(buffer: list[dict[str, Any]]) -> list[dict[str, Any]]:

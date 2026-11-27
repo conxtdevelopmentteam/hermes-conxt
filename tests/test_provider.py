@@ -55,10 +55,11 @@ class StandIn:
                 stand_in.requests.append({"path": self.path, "auth": self.headers.get("Authorization"), "body": body})
                 if self.path in stand_in.delays:
                     time.sleep(stand_in.delays[self.path])
-                status, reply = stand_in.replies.get(self.path, (404, {"detail": "Not Found"}))
-                data = json.dumps(reply).encode()
+                status, reply, *kind = stand_in.replies.get(self.path, (404, {"detail": "Not Found"}))
+                # (status, body) is JSON; (status, text, content type) is sent as given.
+                data = reply.encode() if kind else json.dumps(reply).encode()
                 self.send_response(status)
-                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Type", kind[0] if kind else "application/json")
                 self.send_header("Content-Length", str(len(data)))
                 self.end_headers()
                 self.wfile.write(data)
@@ -446,8 +447,273 @@ def test_missing_arguments_are_refused_before_anything_is_sent(server, secrets, 
     assert server.sent("/mcp/") == []
 
 
-def test_a_streamed_answer_is_read_too():
-    class Resp:
-        headers = {"content-type": "text/event-stream"}
-        text = 'event: message\ndata: {"jsonrpc":"2.0","id":2,"result":{"content":[{"type":"text","text":"ok"}]}}\n\n'
-    assert conxt._jsonrpc_message(Resp())["result"]["content"][0]["text"] == "ok"
+def _sse(*events):
+    return "".join("".join(f"data: {line}\n" for line in e.split("\n")) + "\n" for e in events)
+
+
+def test_a_streamed_answer_is_read_too(server, secrets, tmp_path):
+    body = _sse('{"jsonrpc":"2.0","method":"notifications/progress","params":{}}',
+                '{"jsonrpc":"2.0","id":2,"result":{"content":[{"type":"text","text":"RUN r9"}]}}')
+    server.replies["/mcp/"] = (200, body, "text/event-stream")
+    p = provider(server, tmp_path, secrets=secrets)
+    assert json.loads(p.handle_tool_call("conxt_start_run", {"folder": "f"}))["brief"] == "RUN r9"
+
+
+def test_an_event_split_over_several_data_lines_is_joined():
+    lines = ['data: {"jsonrpc":"2.0","id":2,', 'data: "result":{"content":[]}}', ""]
+    events = list(conxt._sse_events(iter(lines), time.monotonic() + 5))
+    assert events == [{"jsonrpc": "2.0", "id": 2, "result": {"content": []}}]
+
+
+def test_a_batched_answer_is_searched_for_the_calls_response():
+    batch = [{"jsonrpc": "2.0", "method": "notifications/progress"},
+             {"jsonrpc": "2.0", "id": 2, "result": {"content": [{"type": "text", "text": "ok"}]}}]
+    assert conxt._response_for(batch, 2)["result"]["content"][0]["text"] == "ok"
+    assert conxt._response_for(batch, 3) is None
+
+
+def test_a_stream_that_ends_before_the_answer_is_an_error_not_a_success(server, secrets, tmp_path):
+    server.replies["/mcp/"] = (200, _sse('{"jsonrpc":"2.0","method":"notifications/progress","params":{}}'),
+                               "text/event-stream")
+    out = json.loads(provider(server, tmp_path, secrets=secrets).handle_tool_call(
+        "conxt_finish_run", {"run_id": "r1", "report": "x"}))
+    assert "may or may not have run" in out["error"]
+    # sent once: a finish whose outcome is unknown is never repeated
+    assert len([c for c in _tool_calls(server)]) == 1
+
+
+def test_an_empty_or_unreadable_answer_is_an_error(server, secrets, tmp_path):
+    for body in ({}, {"jsonrpc": "2.0", "id": 2}):
+        server.replies["/mcp/"] = (200, body)
+        out = json.loads(provider(server, tmp_path, secrets=secrets).handle_tool_call("conxt_list_agents", {}))
+        assert "error" in out, body
+
+
+def test_a_stream_kept_open_with_heartbeats_stops_at_the_deadline():
+    def forever():
+        while True:
+            yield ": heartbeat"
+            yield ""
+    started = time.monotonic()
+    assert list(conxt._sse_events(forever(), time.monotonic() + 0.2)) == []
+
+
+def test_progress_events_that_never_end_in_the_answer_stop_at_the_deadline():
+    def progress():
+        while True:
+            yield 'data: {"jsonrpc":"2.0","method":"notifications/progress"}'
+            yield ""
+    started = time.monotonic()
+    for _ in conxt._sse_events(progress(), time.monotonic() + 0.2):
+        assert time.monotonic() - started < 2
+
+
+class _Chunks:
+    """A response whose raw body hands over the given chunks, then forever
+    more `tail` if set, else nothing (the end of the stream)."""
+    def __init__(self, chunks, tail=None):
+        self.raw = self
+        self.decode_content = False
+        self._chunks, self._tail = list(chunks), tail
+
+    def read1(self, n):
+        if self._chunks:
+            return self._chunks.pop(0)
+        if self._tail is not None:
+            time.sleep(0.01)
+            return self._tail
+        return b""
+
+
+def test_bytes_that_never_form_a_line_stop_at_the_deadline_and_the_cap():
+    started = time.monotonic()
+    with pytest.raises(conxt._StreamCut):
+        list(conxt._stream_lines(_Chunks([], tail=b"x" * 4096), time.monotonic() + 0.3))
+    assert time.monotonic() - started < 2
+
+
+def test_a_cut_after_a_complete_data_line_is_not_read_as_an_answer():
+    """CodeRabbit on #5: a valid data line then an endless unterminated line
+    was read as a finished event, and its answer accepted."""
+    good = b'data: {"jsonrpc":"2.0","id":2,"result":{"content":[{"type":"text","text":"x"}]}}\n'
+    lines = conxt._stream_lines(_Chunks([good], tail=b"y" * 65536), time.monotonic() + 30)
+    with pytest.raises(conxt._StreamCut):
+        list(conxt._sse_events(lines, time.monotonic() + 30))
+
+
+def test_lines_end_at_cr_lf_or_crlf_even_split_across_reads():
+    """Codex on #5: bare CR line endings, which SSE allows, were never split."""
+    chunks = [b"data: a\r", b"\ndata: b\rdata: c\n", b"\r", b"\n"]
+    assert list(conxt._stream_lines(_Chunks(chunks), time.monotonic() + 5)) == [
+        "data: a", "data: b", "data: c", ""]
+
+
+def test_cr_delimited_events_are_read():
+    body = (b'data: {"jsonrpc":"2.0","method":"notifications/progress"}\r\r'
+            b'data: {"jsonrpc":"2.0","id":2,"result":{"content":[]}}\r\r')
+    events = list(conxt._sse_events(conxt._stream_lines(_Chunks([body]), time.monotonic() + 5),
+                                    time.monotonic() + 5))
+    assert conxt._response_for(events, 2) == {"jsonrpc": "2.0", "id": 2, "result": {"content": []}}
+
+
+def test_fractional_or_negative_grades_are_refused_not_rounded(server, secrets, tmp_path):
+    p = provider(server, tmp_path, secrets=secrets)
+    for bad in (3.9, -1, True, "2.5", "many", "²", "٣", "9" * 5000):
+        out = json.loads(p.handle_tool_call("conxt_finish_run", {"run_id": "r", "report": "x", "graded": bad}))
+        assert "whole number" in out["error"], bad
+    assert server.sent("/mcp/") == []
+    assert conxt._whole(4.0) == 4 and conxt._whole("6") == 6 and conxt._whole(None) == 0
+
+
+def test_a_short_answer_on_a_stream_left_open_is_read_at_once():
+    """Codex on #5: a short event on a stream the server keeps open sat in
+    requests' 512-byte read buffer until the deadline, then was thrown away."""
+    class Open(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.0"
+
+        def do_POST(self):
+            body = json.loads(self.rfile.read(int(self.headers["Content-Length"])) or b"{}")
+            if body.get("id") != 2:
+                data = b'{"jsonrpc":"2.0","id":1,"result":{}}'
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+                return
+            # A plain stream: no Content-Length, no chunking, left open.
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.wfile.write(b'data: {"jsonrpc":"2.0","id":2,"result":{"content":[{"type":"text","text":"fast"}]}}\n\n')
+            self.wfile.flush()
+            for _ in range(20):   # heartbeats, well past the client's deadline
+                time.sleep(0.3)
+                try:
+                    self.wfile.write(b": ping\n\n")
+                    self.wfile.flush()
+                except OSError:
+                    return
+
+        def log_message(self, *args):
+            pass
+
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), Open)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    try:
+        client = conxt._Client("k", f"http://127.0.0.1:{srv.server_address[1]}")
+        started = time.monotonic()
+        assert client.mcp_tool("start_run", {"project": "f"}, timeout=3.0) == "fast"
+        assert time.monotonic() - started < 2.0
+    finally:
+        srv.shutdown()
+
+
+def test_a_compressed_streamed_answer_is_decompressed(server, secrets, tmp_path):
+    """Codex on #5: raw reads skip decompression, and requests asks for gzip."""
+    import gzip
+    body = gzip.compress(_sse('{"jsonrpc":"2.0","id":2,"result":{"content":[{"type":"text","text":"unzipped"}]}}').encode())
+
+    class Gz(BaseHTTPRequestHandler):
+        def do_POST(self):
+            self.rfile.read(int(self.headers["Content-Length"]))
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Content-Encoding", "gzip")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *args):
+            pass
+
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), Gz)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    try:
+        client = conxt._Client("k", f"http://127.0.0.1:{srv.server_address[1]}")
+        assert client.mcp_tool("start_run", {"project": "f"}, timeout=3.0) == "unzipped"
+    finally:
+        srv.shutdown()
+
+
+def test_a_stream_that_stalls_mid_answer_is_reported_not_raised():
+    """Codex on #5: a stalled raw read raised urllib3's ReadTimeoutError,
+    which escaped handle_tool_call instead of becoming the tool's error."""
+    class Stall(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.0"
+
+        def do_POST(self):
+            body = json.loads(self.rfile.read(int(self.headers["Content-Length"])) or b"{}")
+            if body.get("id") != 2:
+                data = b'{"jsonrpc":"2.0","id":1,"result":{}}'
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+                return
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.end_headers()
+            self.wfile.write(b": ping\n\n")
+            self.wfile.flush()
+            time.sleep(3)   # longer than the client's read timeout
+
+        def log_message(self, *args):
+            pass
+
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), Stall)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    try:
+        p = conxt.ConxtMemoryProvider()
+        p._client = conxt._Client("k", f"http://127.0.0.1:{srv.server_address[1]}")
+        original = p._client.mcp_tool
+        p._client.mcp_tool = lambda tool, args, timeout=1.0: original(tool, args, timeout=1.0)
+        out = json.loads(p.handle_tool_call("conxt_finish_run", {"run_id": "r", "report": "x"}))
+        assert "may or may not have run" in out["error"]
+    finally:
+        srv.shutdown()
+
+
+def test_a_tool_call_that_times_out_says_its_outcome_is_unknown(server, secrets, tmp_path):
+    server.delays["/mcp/"] = 2.0
+    server.replies["/mcp/"] = _mcp_reply("late")
+    p = provider(server, tmp_path, secrets=secrets)
+    original = p._client.mcp_tool
+    p._client.mcp_tool = lambda tool, args, timeout=0.5: original(tool, args, timeout=0.5)
+    out = json.loads(p.handle_tool_call("conxt_list_agents", {}))
+    # the very first request (initialize) times out: nothing has run, and it says so plainly
+    assert "in time" in out["error"] and "may or may not" not in out["error"]
+
+
+def test_a_finish_that_times_out_says_it_may_have_run():
+    """CodeRabbit on #5: a finish_run whose answer timed out said only "did
+    not answer in time", though the run may already be finished in Conxt."""
+    class SlowCall(BaseHTTPRequestHandler):
+        def do_POST(self):
+            body = json.loads(self.rfile.read(int(self.headers["Content-Length"])) or b"{}")
+            if body.get("method") == "tools/call":
+                time.sleep(2)
+            data = b'{"jsonrpc":"2.0","id":1,"result":{}}'
+            try:
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+            except OSError:
+                pass
+
+        def log_message(self, *args):
+            pass
+
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), SlowCall)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    try:
+        client = conxt._Client("k", f"http://127.0.0.1:{srv.server_address[1]}")
+        with pytest.raises(conxt.ConxtError) as caught:
+            client.mcp_tool("finish_run", {"run_id": "r", "report": "x"}, timeout=0.5)
+        assert "may or may not have run" in str(caught.value)
+    finally:
+        srv.shutdown()
