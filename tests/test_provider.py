@@ -376,3 +376,78 @@ def test_a_built_in_memory_add_is_mirrored_and_a_removal_is_not(server, secrets,
     (req,) = server.requests
     assert req["path"] == "/import/"
     assert req["body"]["payload"]["memories"][0] == {"type": "preference", "content": "Prefers British spelling."}
+
+
+# -- agent folders (0.2.0) -----------------------------------------------------
+
+def _mcp_reply(text, is_error=False):
+    return (200, {"jsonrpc": "2.0", "id": 2, "result": {"content": [{"type": "text", "text": text}],
+                                                         "isError": is_error}})
+
+
+def _tool_calls(server):
+    return [r["body"]["params"] for r in server.sent("/mcp/") if r["body"].get("method") == "tools/call"]
+
+
+def test_the_agent_folder_tools_are_offered_without_any_setup_beyond_the_key(server, secrets, tmp_path):
+    names = {s["name"] for s in provider(server, tmp_path, secrets=secrets).get_tool_schemas()}
+    assert {"conxt_define_agent", "conxt_list_agents", "conxt_start_run", "conxt_finish_run"} <= names
+
+
+def test_a_run_starts_on_conxts_mcp_server_with_the_key(server, secrets, tmp_path):
+    server.replies["/mcp/"] = _mcp_reply("RUN r1\nAgent: grokbot\nINSTRUCTIONS ...")
+    p = provider(server, tmp_path, secrets=secrets)
+    out = json.loads(p.handle_tool_call("conxt_start_run", {"folder": "grokbot_project"}))
+    assert out["brief"].startswith("RUN r1")
+    assert _tool_calls(server) == [{"name": "start_run", "arguments": {"project": "grokbot_project"}}]
+    assert all(r["auth"] == "Bearer cx_test_key" for r in server.sent("/mcp/"))
+    # initialize, then initialized, then the call: what any MCP server expects
+    assert [r["body"].get("method") for r in server.sent("/mcp/")] == [
+        "initialize", "notifications/initialized", "tools/call"]
+
+
+def test_a_run_is_finished_with_its_report_lessons_and_grades(server, secrets, tmp_path):
+    server.replies["/mcp/"] = _mcp_reply("Run kept. 2 of 2 lessons saved.")
+    p = provider(server, tmp_path, secrets=secrets)
+    out = json.loads(p.handle_tool_call("conxt_finish_run", {
+        "run_id": "r1", "report": "# Report", "lessons": ["a", "b"], "graded": 10, "hits": "6",
+        "carry": {"picks": [{"symbol": "X", "last": 1}]}}))
+    assert out["result"].startswith("Run kept")
+    assert _tool_calls(server)[0] == {"name": "finish_run", "arguments": {
+        "run_id": "r1", "report": "# Report", "lessons": ["a", "b"], "graded": 10, "hits": 6,
+        "carry": {"picks": [{"symbol": "X", "last": 1}]}}}
+
+
+def test_an_agent_md_is_saved_to_its_folder(server, secrets, tmp_path):
+    server.replies["/mcp/"] = _mcp_reply("Agent 'grokbot' lives in the folder 'grokbot_project'.")
+    p = provider(server, tmp_path, secrets=secrets)
+    p.handle_tool_call("conxt_define_agent", {"folder": "grokbot_project", "agent_md": "---\nname: grokbot\n---\nDo it."})
+    assert _tool_calls(server)[0]["arguments"] == {"project": "grokbot_project",
+                                                    "agent_md": "---\nname: grokbot\n---\nDo it."}
+
+
+def test_a_refusal_from_the_mcp_server_reaches_the_agent(server, secrets, tmp_path):
+    server.replies["/mcp/"] = _mcp_reply("The project 'x' is not an agent folder yet.", is_error=True)
+    out = json.loads(provider(server, tmp_path, secrets=secrets).handle_tool_call("conxt_start_run", {"folder": "x"}))
+    assert "not an agent folder yet" in out["error"]
+
+
+def test_a_rejected_key_says_so(server, secrets, tmp_path):
+    server.replies["/mcp/"] = (401, {"detail": "bad key"})
+    out = json.loads(provider(server, tmp_path, secrets=secrets).handle_tool_call("conxt_list_agents", {}))
+    assert "API key" in out["error"]
+
+
+def test_missing_arguments_are_refused_before_anything_is_sent(server, secrets, tmp_path):
+    p = provider(server, tmp_path, secrets=secrets)
+    for tool, args in (("conxt_start_run", {}), ("conxt_define_agent", {"folder": "f"}),
+                       ("conxt_finish_run", {"report": "r"}), ("conxt_finish_run", {"run_id": "r", "graded": "many"})):
+        assert "error" in json.loads(p.handle_tool_call(tool, args)), tool
+    assert server.sent("/mcp/") == []
+
+
+def test_a_streamed_answer_is_read_too():
+    class Resp:
+        headers = {"content-type": "text/event-stream"}
+        text = 'event: message\ndata: {"jsonrpc":"2.0","id":2,"result":{"content":[{"type":"text","text":"ok"}]}}\n\n'
+    assert conxt._jsonrpc_message(Resp())["result"]["content"][0]["text"] == "ok"

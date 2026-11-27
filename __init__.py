@@ -16,6 +16,11 @@ What it does, and when:
 - On request, three tools: conxt_search, conxt_remember (a personal memory) and
   conxt_propose (a team memory, which waits for a person's approval in Conxt;
   an API key cannot approve its own proposal).
+- Agent folders (0.2.0): conxt_define_agent, conxt_list_agents,
+  conxt_start_run and conxt_finish_run. A Conxt project folder holds an
+  agent's AGENT.md, memory, lessons and track record; a Hermes cron job runs
+  it with one prompt. These call Conxt's MCP server, where agent folders
+  live, with the same API key, so installing the plugin is all it takes.
 - When Hermes's built-in memory tool adds an entry, the same text is saved to
   Conxt as a personal memory.
 
@@ -42,6 +47,7 @@ from agent.secret_scope import get_secret
 
 logger = logging.getLogger(__name__)
 
+VERSION = "0.2.0"
 DEFAULT_BASE_URL = "https://mcp.conxt.dev"
 CONFIG_FILE = "conxt.json"
 SOURCE = "hermes"
@@ -66,6 +72,7 @@ CAPTURE_MAX_TOTAL_CHARS = 100_000
 FLUSH_EVERY_MESSAGES = 10
 BUFFER_CAP_MESSAGES = 400  # while Conxt is unreachable; oldest dropped first
 
+AGENT_TOOLS = ("conxt_define_agent", "conxt_list_agents", "conxt_start_run", "conxt_finish_run")
 MEMORY_TYPES = ("decision", "preference", "entity", "open_question", "coding_rule", "tool_choice", "workflow")
 _UUID = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.I)
 
@@ -148,11 +155,73 @@ class _Client:
                 "dry_run": False}
         return self._post("/import/", body, WRITE_TIMEOUT_S) or {}
 
+    def mcp_tool(self, tool: str, arguments: dict[str, Any], timeout: float = WRITE_TIMEOUT_S) -> str:
+        """Call one tool on Conxt's MCP server and return its text.
+
+        Agent folders exist only as MCP tools (conxt-engine #434). Conxt's
+        server answers a call without a session, but a session id is
+        carried if it hands one out, and a streamed (SSE) answer is read
+        too, so a change on the server side does not break the plugin."""
+        import requests
+
+        url = f"{self.base_url}/mcp/"
+        headers = {"Authorization": f"Bearer {self._api_key}", "User-Agent": "hermes-conxt",
+                   "Content-Type": "application/json", "Accept": "application/json, text/event-stream"}
+
+        def send(body: dict[str, Any]) -> Any:
+            try:
+                resp = requests.post(url, json=body, headers=headers, timeout=timeout)
+            except requests.ReadTimeout as exc:
+                raise ConxtError(f"Conxt did not answer {tool} in time", sent=True) from exc
+            except requests.RequestException as exc:
+                raise ConxtError(f"Conxt could not be reached: {exc.__class__.__name__}") from exc
+            if resp.status_code in (401, 403):
+                raise ConxtError("Conxt refused the API key. Check CONXT_API_KEY.", resp.status_code)
+            if not resp.ok:
+                raise ConxtError(f"Conxt refused {tool} ({resp.status_code})", resp.status_code)
+            if resp.headers.get("mcp-session-id"):
+                headers["Mcp-Session-Id"] = resp.headers["mcp-session-id"]
+            return _jsonrpc_message(resp)
+
+        send({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
+            "protocolVersion": "2025-03-26", "capabilities": {},
+            "clientInfo": {"name": "hermes-conxt", "version": VERSION}}})
+        send({"jsonrpc": "2.0", "method": "notifications/initialized"})
+        msg = send({"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                    "params": {"name": tool, "arguments": arguments}}) or {}
+        if msg.get("error"):
+            raise ConxtError(f"Conxt could not run {tool}: {msg['error'].get('message') or msg['error']}")
+        result = msg.get("result") or {}
+        text = "\n".join(c.get("text", "") for c in result.get("content") or [] if isinstance(c, dict)).strip()
+        if result.get("isError"):
+            raise ConxtError(text or f"Conxt could not run {tool}")
+        return text
+
     def propose(self, team_id: str, content: str, memory_type: str, title: str) -> dict[str, Any]:
         # A write to a team with an API key is stored as pending; a person on
         # the team approves it before it is recalled for anyone.
         body = {"type": memory_type, "title": title, "content": content, "source": SOURCE, "tags": []}
         return self._post(f"/teams/{team_id}/memories/create", body, WRITE_TIMEOUT_S) or {}
+
+
+def _jsonrpc_message(resp) -> Any:
+    """The JSON-RPC message in an MCP answer: a JSON body, or the last data
+    line of a server-sent-events body."""
+    if "text/event-stream" in (resp.headers.get("content-type") or ""):
+        found = None
+        for line in resp.text.splitlines():
+            if line.startswith("data:"):
+                try:
+                    found = json.loads(line[5:].strip())
+                except ValueError:
+                    continue
+        return found
+    if not (resp.text or "").strip():
+        return None
+    try:
+        return resp.json()
+    except ValueError:
+        return None
 
 
 def _schema(name: str, description: str, properties: dict, required: list[str]) -> dict[str, Any]:
@@ -173,6 +242,32 @@ TOOL_SCHEMAS = [
             "redacted before storage. Use for things worth knowing in future sessions.",
             {"content": {"type": "string", "description": "The memory, as one self-contained statement."},
              "memory_type": _TYPE_PROP}, ["content"]),
+    _schema("conxt_define_agent",
+            "Make a Conxt project folder the home of an agent. agent_md is the agent's AGENT.md: optional "
+            "front matter (name, and every: a schedule such as 2h or 1d), then its instructions. Saving "
+            "again replaces the instructions; the folder's memory and run history are kept.",
+            {"folder": {"type": "string", "description": "The Conxt project folder, e.g. grokbot_project."},
+             "agent_md": {"type": "string", "description": "The whole AGENT.md text."}}, ["folder", "agent_md"]),
+    _schema("conxt_list_agents",
+            "List the user's Conxt agent folders: each agent's folder, schedule, last run, skill level and "
+            "whether a run is due.", {}, []),
+    _schema("conxt_start_run",
+            "Start a run of the agent in a Conxt folder. Returns the run id, the agent's instructions, what "
+            "the folder remembers, its earlier lessons, its skill level and what its last run carried "
+            "forward to be graded. Follow the instructions, then finish the run.",
+            {"folder": {"type": "string", "description": "The agent's Conxt project folder."}}, ["folder"]),
+    _schema("conxt_finish_run",
+            "Finish a Conxt agent run: its report, up to five short general lessons (saved to the folder as "
+            "the agent's own), how many of the last run's results were graded and how many held up, and "
+            "what to carry to the next run.",
+            {"run_id": {"type": "string", "description": "The id conxt_start_run returned."},
+             "report": {"type": "string", "description": "The run's output."},
+             "lessons": {"type": "array", "items": {"type": "string"},
+                         "description": "Up to five short, general lessons (optional)."},
+             "graded": {"type": "integer", "description": "Previous results checked this run (default 0)."},
+             "hits": {"type": "integer", "description": "How many of those held up (default 0)."},
+             "carry": {"type": "object", "description": "What the next run should grade (optional)."}},
+            ["run_id", "report"]),
     _schema("conxt_propose",
             "Propose a memory to the configured Conxt team. It is not shared until a person on the team "
             "approves it in Conxt. Use for decisions or rules the whole team should follow.",
@@ -247,7 +342,9 @@ class ConxtMemoryProvider(MemoryProvider):
         team = ("Team memory is on: conxt_propose sends a memory to the team, where a person approves it "
                 "before anyone recalls it.") if self._team_id else "No team is configured, so conxt_propose is off."
         return ("# Conxt memory\nRelevant memories are recalled before each turn. Use conxt_search to look "
-                "further and conxt_remember to keep something for future sessions. " + team)
+                "further and conxt_remember to keep something for future sessions. " + team
+                + " To run an agent that lives in a Conxt folder, call conxt_start_run, follow the instructions "
+                "it returns, then conxt_finish_run.")
 
     # -- recall --------------------------------------------------------------
 
@@ -385,6 +482,8 @@ class ConxtMemoryProvider(MemoryProvider):
 
     def _dispatch(self, tool_name: str, args: dict[str, Any]) -> dict[str, Any]:
         assert self._client is not None
+        if tool_name in AGENT_TOOLS:
+            return self._agent_tool(tool_name, args)
         if tool_name == "conxt_search":
             query = str(args.get("query") or "").strip()
             if not query:
@@ -421,6 +520,41 @@ class ConxtMemoryProvider(MemoryProvider):
                                 "until then.") if status == "pending" else f"Stored as {status}."}
 
         return {"error": f"Unknown tool: {tool_name}"}
+
+
+    def _agent_tool(self, tool_name: str, args: dict[str, Any]) -> dict[str, Any]:
+        """Agent folders, on Conxt's MCP server. Personal folders only:
+        Conxt refuses a team-scoped key, and says so."""
+        assert self._client is not None
+        folder = str(args.get("folder") or "").strip()
+        if tool_name == "conxt_list_agents":
+            return {"agents": self._client.mcp_tool("list_agents", {})}
+        if tool_name in ("conxt_define_agent", "conxt_start_run") and not folder:
+            return {"error": "folder is required"}
+        if tool_name == "conxt_define_agent":
+            agent_md = str(args.get("agent_md") or "").strip()
+            if not agent_md:
+                return {"error": "agent_md is required"}
+            return {"result": self._client.mcp_tool("define_agent", {"project": folder, "agent_md": agent_md})}
+        if tool_name == "conxt_start_run":
+            # The brief is long and the agent reads all of it; a slow memory
+            # read must not cut it off, so this waits like a write.
+            return {"brief": self._client.mcp_tool("start_run", {"project": folder})}
+        run_id = str(args.get("run_id") or "").strip()
+        if not run_id:
+            return {"error": "run_id is required"}
+        call: dict[str, Any] = {"run_id": run_id, "report": str(args.get("report") or "")}
+        lessons = args.get("lessons")
+        if isinstance(lessons, list):
+            call["lessons"] = [str(x) for x in lessons][:5]
+        for key in ("graded", "hits"):
+            try:
+                call[key] = max(0, int(args.get(key) or 0))
+            except (TypeError, ValueError):
+                return {"error": f"{key} must be a whole number"}
+        if args.get("carry") is not None:
+            call["carry"] = args["carry"]
+        return {"result": self._client.mcp_tool("finish_run", call)}
 
 
 def _next_batch(buffer: list[dict[str, Any]]) -> list[dict[str, Any]]:

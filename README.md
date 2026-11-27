@@ -39,6 +39,27 @@ Any Conxt account can create one, Free included.
 | **After the conversation** | Turns are kept locally and sent in batches: every 5 exchanges, before Hermes compresses the context, when you switch or end a session, and at shutdown. Conxt extracts memories from each batch. |
 | **When Hermes's built-in memory adds an entry** | The same text is saved to your Conxt memory. |
 | **When the agent chooses** | `conxt_search` looks something up, `conxt_remember` saves a personal memory, and `conxt_propose` proposes a team memory (only when a team is set). |
+| **When you run an agent folder** | `conxt_start_run` hands the agent its instructions, memory, lessons and skill level from a Conxt folder; `conxt_finish_run` saves its report, lessons and graded results. `conxt_define_agent` and `conxt_list_agents` set one up and show them all. |
+
+## Agents that live in a Conxt folder
+
+A Conxt project folder can be the home of an agent: its instructions (an AGENT.md), its
+memory, the lessons it writes and a skill level it earns from graded results. Hermes runs it;
+Conxt keeps everything between runs. Nothing else to install: the plugin's API key is enough.
+
+1. Save the instructions once. Ask Hermes:
+   *"Save this as the AGENT.md of my Conxt folder `market_watch`:"* followed by the file, or
+   upload the AGENT.md into the folder from the Conxt dashboard (Import).
+2. Schedule it with a Hermes cron job, with this prompt:
+
+   ```
+   Run your Conxt folder market_watch. Call conxt_start_run, follow the instructions it
+   returns exactly, then call conxt_finish_run with the run id, the report, the lessons,
+   graded, hits and carry.
+   ```
+3. Ask *"list my Conxt agents"* to see each one's runs and skill level.
+
+Personal folders only for now; a team-scoped key is refused.
 
 **Safe for unattended runs.** Scheduled (cron), subagent and flush runs are never written to
 automatically. If Conxt is slow or unreachable, recall is skipped for that turn. Unsent turns
