@@ -496,12 +496,34 @@ def test_a_stream_kept_open_with_heartbeats_stops_at_the_deadline():
             yield ""
     started = time.monotonic()
     assert list(conxt._sse_events(forever(), time.monotonic() + 0.2)) == []
+
+
+def test_progress_events_that_never_end_in_the_answer_stop_at_the_deadline():
+    def progress():
+        while True:
+            yield 'data: {"jsonrpc":"2.0","method":"notifications/progress"}'
+            yield ""
+    started = time.monotonic()
+    for _ in conxt._sse_events(progress(), time.monotonic() + 0.2):
+        assert time.monotonic() - started < 2
+
+
+def test_bytes_that_never_form_a_line_stop_at_the_deadline_and_the_cap():
+    class Raw:
+        def read1(self, n):
+            time.sleep(0.01)
+            return b"x" * 4096
+    class Resp:
+        raw = Raw()
+    started = time.monotonic()
+    assert list(conxt._stream_lines(Resp(), time.monotonic() + 0.3)) == []
+    assert time.monotonic() - started < 2
     assert time.monotonic() - started < 2
 
 
 def test_fractional_or_negative_grades_are_refused_not_rounded(server, secrets, tmp_path):
     p = provider(server, tmp_path, secrets=secrets)
-    for bad in (3.9, -1, True, "2.5", "many"):
+    for bad in (3.9, -1, True, "2.5", "many", "²", "٣"):
         out = json.loads(p.handle_tool_call("conxt_finish_run", {"run_id": "r", "report": "x", "graded": bad}))
         assert "whole number" in out["error"], bad
     assert server.sent("/mcp/") == []
@@ -615,5 +637,48 @@ def test_a_stream_that_stalls_mid_answer_is_reported_not_raised():
         p._client.mcp_tool = lambda tool, args, timeout=1.0: original(tool, args, timeout=1.0)
         out = json.loads(p.handle_tool_call("conxt_finish_run", {"run_id": "r", "report": "x"}))
         assert "may or may not have run" in out["error"]
+    finally:
+        srv.shutdown()
+
+
+def test_a_tool_call_that_times_out_says_its_outcome_is_unknown(server, secrets, tmp_path):
+    server.delays["/mcp/"] = 2.0
+    server.replies["/mcp/"] = _mcp_reply("late")
+    p = provider(server, tmp_path, secrets=secrets)
+    original = p._client.mcp_tool
+    p._client.mcp_tool = lambda tool, args, timeout=0.5: original(tool, args, timeout=0.5)
+    out = json.loads(p.handle_tool_call("conxt_list_agents", {}))
+    # the very first request (initialize) times out: nothing has run, and it says so plainly
+    assert "in time" in out["error"] and "may or may not" not in out["error"]
+
+
+def test_a_finish_that_times_out_says_it_may_have_run():
+    """CodeRabbit on #5: a finish_run whose answer timed out said only "did
+    not answer in time", though the run may already be finished in Conxt."""
+    class SlowCall(BaseHTTPRequestHandler):
+        def do_POST(self):
+            body = json.loads(self.rfile.read(int(self.headers["Content-Length"])) or b"{}")
+            if body.get("method") == "tools/call":
+                time.sleep(2)
+            data = b'{"jsonrpc":"2.0","id":1,"result":{}}'
+            try:
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+            except OSError:
+                pass
+
+        def log_message(self, *args):
+            pass
+
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), SlowCall)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    try:
+        client = conxt._Client("k", f"http://127.0.0.1:{srv.server_address[1]}")
+        with pytest.raises(conxt.ConxtError) as caught:
+            client.mcp_tool("finish_run", {"run_id": "r", "report": "x"}, timeout=0.5)
+        assert "may or may not have run" in str(caught.value)
     finally:
         srv.shutdown()

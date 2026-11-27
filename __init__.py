@@ -200,10 +200,13 @@ class _Client:
 
         want = body.get("id")
         deadline = time.monotonic() + timeout
+        # Only a tool call can have run without an answer arriving; say so.
+        unknown = ("; it may or may not have run. Check in Conxt before running it again"
+                   if body.get("method") == "tools/call" else "")
         try:
             resp = requests.post(url, json=body, headers=headers, timeout=timeout, stream=True)
         except requests.ReadTimeout as exc:
-            raise ConxtError(f"Conxt did not answer {tool} in time", sent=True) from exc
+            raise ConxtError(f"Conxt did not answer {tool} in time{unknown}", sent=True) from exc
         except requests.RequestException as exc:
             raise ConxtError(f"Conxt could not be reached: {exc.__class__.__name__}") from exc
         try:
@@ -216,12 +219,12 @@ class _Client:
             if want is None:
                 return None
             if "text/event-stream" in (resp.headers.get("content-type") or ""):
-                for event in _sse_events(_stream_lines(resp), deadline):
+                for event in _sse_events(_stream_lines(resp, deadline), deadline):
                     found = _response_for(event, want)
                     if found is not None:
                         return found
                 if time.monotonic() > deadline:
-                    raise ConxtError(f"Conxt did not answer {tool} in time", sent=True)
+                    raise ConxtError(f"Conxt did not answer {tool} in time{unknown}", sent=True)
                 return None
             try:
                 return _response_for(resp.json(), want)
@@ -246,7 +249,10 @@ class _Client:
         return self._post(f"/teams/{team_id}/memories/create", body, WRITE_TIMEOUT_S) or {}
 
 
-def _stream_lines(resp):
+MAX_STREAM_LINE = 1_000_000  # bytes; an MCP answer line is far smaller
+
+
+def _stream_lines(resp, deadline: float):
     """The lines of a streamed body, each handed over as soon as it has
     arrived. requests' iter_lines reads in 512-byte blocks and can sit on a
     short answer while the server keeps the stream open (Codex on #5), so
@@ -263,6 +269,10 @@ def _stream_lines(resp):
         if not chunk:
             break
         pending += chunk
+        # Bytes that never form a line must not hold the run past its
+        # deadline or grow without bound (CodeRabbit on #5).
+        if time.monotonic() > deadline or len(pending) > MAX_STREAM_LINE:
+            return
         while b"\n" in pending:
             line, pending = pending.split(b"\n", 1)
             yield line.rstrip(b"\r").decode("utf-8", "replace")
@@ -287,7 +297,9 @@ def _sse_events(lines, deadline: float):
                 except ValueError:
                     pass
                 data = []
-            elif time.monotonic() > deadline:
+            # Checked after every event: progress events that never end in
+            # the answer must not keep the run waiting (CodeRabbit on #5).
+            if time.monotonic() > deadline:
                 return
         elif line.startswith("data:"):
             data.append(line[6:] if line[5:6] == " " else line[5:])
@@ -653,8 +665,8 @@ def _whole(value: Any) -> Optional[int]:
         return value if value >= 0 else None
     if isinstance(value, float):
         return int(value) if value.is_integer() and value >= 0 else None
-    if isinstance(value, str) and value.strip().isdigit():
-        return int(value.strip())
+    if isinstance(value, str) and re.fullmatch(r"[0-9]+", value.strip()):
+        return int(value.strip())   # "²" passes isdigit() but not int() (CodeRabbit on #5)
     return None
 
 
