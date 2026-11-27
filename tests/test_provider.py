@@ -55,10 +55,11 @@ class StandIn:
                 stand_in.requests.append({"path": self.path, "auth": self.headers.get("Authorization"), "body": body})
                 if self.path in stand_in.delays:
                     time.sleep(stand_in.delays[self.path])
-                status, reply = stand_in.replies.get(self.path, (404, {"detail": "Not Found"}))
-                data = json.dumps(reply).encode()
+                status, reply, *kind = stand_in.replies.get(self.path, (404, {"detail": "Not Found"}))
+                # (status, body) is JSON; (status, text, content type) is sent as given.
+                data = reply.encode() if kind else json.dumps(reply).encode()
                 self.send_response(status)
-                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Type", kind[0] if kind else "application/json")
                 self.send_header("Content-Length", str(len(data)))
                 self.end_headers()
                 self.wfile.write(data)
@@ -446,8 +447,62 @@ def test_missing_arguments_are_refused_before_anything_is_sent(server, secrets, 
     assert server.sent("/mcp/") == []
 
 
-def test_a_streamed_answer_is_read_too():
-    class Resp:
-        headers = {"content-type": "text/event-stream"}
-        text = 'event: message\ndata: {"jsonrpc":"2.0","id":2,"result":{"content":[{"type":"text","text":"ok"}]}}\n\n'
-    assert conxt._jsonrpc_message(Resp())["result"]["content"][0]["text"] == "ok"
+def _sse(*events):
+    return "".join("".join(f"data: {line}\n" for line in e.split("\n")) + "\n" for e in events)
+
+
+def test_a_streamed_answer_is_read_too(server, secrets, tmp_path):
+    body = _sse('{"jsonrpc":"2.0","method":"notifications/progress","params":{}}',
+                '{"jsonrpc":"2.0","id":2,"result":{"content":[{"type":"text","text":"RUN r9"}]}}')
+    server.replies["/mcp/"] = (200, body, "text/event-stream")
+    p = provider(server, tmp_path, secrets=secrets)
+    assert json.loads(p.handle_tool_call("conxt_start_run", {"folder": "f"}))["brief"] == "RUN r9"
+
+
+def test_an_event_split_over_several_data_lines_is_joined():
+    lines = ['data: {"jsonrpc":"2.0","id":2,', 'data: "result":{"content":[]}}', ""]
+    events = list(conxt._sse_events(iter(lines), time.monotonic() + 5))
+    assert events == [{"jsonrpc": "2.0", "id": 2, "result": {"content": []}}]
+
+
+def test_a_batched_answer_is_searched_for_the_calls_response():
+    batch = [{"jsonrpc": "2.0", "method": "notifications/progress"},
+             {"jsonrpc": "2.0", "id": 2, "result": {"content": [{"type": "text", "text": "ok"}]}}]
+    assert conxt._response_for(batch, 2)["result"]["content"][0]["text"] == "ok"
+    assert conxt._response_for(batch, 3) is None
+
+
+def test_a_stream_that_ends_before_the_answer_is_an_error_not_a_success(server, secrets, tmp_path):
+    server.replies["/mcp/"] = (200, _sse('{"jsonrpc":"2.0","method":"notifications/progress","params":{}}'),
+                               "text/event-stream")
+    out = json.loads(provider(server, tmp_path, secrets=secrets).handle_tool_call(
+        "conxt_finish_run", {"run_id": "r1", "report": "x"}))
+    assert "may or may not have run" in out["error"]
+    # sent once: a finish whose outcome is unknown is never repeated
+    assert len([c for c in _tool_calls(server)]) == 1
+
+
+def test_an_empty_or_unreadable_answer_is_an_error(server, secrets, tmp_path):
+    for body in ({}, {"jsonrpc": "2.0", "id": 2}):
+        server.replies["/mcp/"] = (200, body)
+        out = json.loads(provider(server, tmp_path, secrets=secrets).handle_tool_call("conxt_list_agents", {}))
+        assert "error" in out, body
+
+
+def test_a_stream_kept_open_with_heartbeats_stops_at_the_deadline():
+    def forever():
+        while True:
+            yield ": heartbeat"
+            yield ""
+    started = time.monotonic()
+    assert list(conxt._sse_events(forever(), time.monotonic() + 0.2)) == []
+    assert time.monotonic() - started < 2
+
+
+def test_fractional_or_negative_grades_are_refused_not_rounded(server, secrets, tmp_path):
+    p = provider(server, tmp_path, secrets=secrets)
+    for bad in (3.9, -1, True, "2.5", "many"):
+        out = json.loads(p.handle_tool_call("conxt_finish_run", {"run_id": "r", "report": "x", "graded": bad}))
+        assert "whole number" in out["error"], bad
+    assert server.sent("/mcp/") == []
+    assert conxt._whole(4.0) == 4 and conxt._whole("6") == 6 and conxt._whole(None) == 0

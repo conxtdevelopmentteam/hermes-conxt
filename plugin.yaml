@@ -1,5 +1,5 @@
 name: conxt
-version: 0.2.0
+version: 0.2.1
 description: "Conxt governed memory: recall before each turn, capture after it, team memory through approval, and agents that live in a Conxt folder."
 requires_hermes: ">=0.21.6"
 requires_env:
